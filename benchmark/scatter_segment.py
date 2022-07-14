@@ -8,6 +8,7 @@ import torch
 from scipy.io import loadmat
 
 from torch_scatter import scatter, segment_coo, segment_csr
+from torch.profiler import profile, record_function, ProfilerActivity
 
 short_rows = [
     ('DIMACS10', 'citationCiteseer'),
@@ -83,6 +84,11 @@ def time_func(func, x):
     try:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+
+        # warmup
+        for _ in range(2):
+            func(x)
+
         t = time.perf_counter()
 
         if not args.with_backward:
@@ -210,20 +216,74 @@ def timing(dataset):
     print()
 
 
+def limited_timing(dataset, with_profiling):
+    group, name = dataset
+    mat = loadmat(f'{name}.mat')['Problem'][0][0][2].tocsr()
+    rowptr = torch.from_numpy(mat.indptr).to(args.device, torch.long)
+    row = torch.from_numpy(mat.tocoo().row).to(args.device, torch.long)
+    row2 = row[torch.randperm(row.size(0))]
+    dim_size = rowptr.size(0) - 1
+    avg_row_len = row.size(0) / dim_size
+
+    def sca_row(x):
+        return scatter(x, row, dim=0, dim_size=dim_size, reduce=args.reduce)
+
+    def sca_col(x):
+        return scatter(x, row2, dim=0, dim_size=dim_size, reduce=args.reduce)
+
+    def run(size):
+        x = torch.randn((row.size(0), size), device=args.device)
+        x = x.squeeze(-1) if size == 1 else x
+        return time_func(sca_row, x), time_func(sca_col, x)
+
+    name = f'{group}/{name}'
+    print(f'{bold(name)} (avg row length: {avg_row_len:.2f}):')
+
+    if with_profiling:
+        with profile(activities=[ProfilerActivity.CPU],
+                     record_shapes=True) as prof:
+            run(sizes[-1])
+        print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=5))
+        return
+
+    row_times, col_times = [], []
+    for size in sizes:
+        rt, ct = run(size)
+        row_times.append(rt)
+        col_times.append(ct)
+
+    print('\t'.join(['    '] + [f'{size:>5}' for size in sizes]))
+    print('\t'.join([bold('SCA_ROW')] + [f'{t:.4f}' for t in row_times]))
+    print('\t'.join([bold('SCA_COL')] + [f'{t:.4f}' for t in col_times]))
+    print()
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--reduce', type=str, required=True,
                         choices=['sum', 'mean', 'min', 'max'])
     parser.add_argument('--with_backward', action='store_true')
-    parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--device', type=str, default='cpu')
+    parser.add_argument('--verify_correctness', action='store_true')
+    parser.add_argument('--limited_val', action='store_true')
+    parser.add_argument('--profile', action='store_true')
     args = parser.parse_args()
-    iters = 1 if args.device == 'cpu' else 20
+    if args.limited_val:
+        args.device = 'cpu'
+    iters = 10 if args.device == 'cpu' else 20
     sizes = [1, 16, 32, 64, 128, 256, 512]
-    sizes = sizes[:3] if args.device == 'cpu' else sizes
+    sizes = sizes[:-3] if args.device == 'cpu' else sizes
 
-    for _ in range(10):  # Warmup.
-        torch.randn(100, 100, device=args.device).sum()
+    if args.limited_val:
+        long_rows = long_rows[:1]
     for dataset in itertools.chain(short_rows, long_rows):
         download(dataset)
-        correctness(dataset)
-        timing(dataset)
+        if args.verify_correctness:
+            correctness(dataset)
+            continue
+        for _ in range(10):  # Warmup.
+            torch.randn(100, 100, device=args.device).sum()
+        if args.limited_val:
+            limited_timing(dataset, args.profile)
+        else:
+            timing(dataset)

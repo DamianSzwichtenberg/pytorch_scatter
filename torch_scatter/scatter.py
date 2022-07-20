@@ -1,14 +1,22 @@
+import os
 from typing import Optional, Tuple
 
 import torch
 
 from .utils import broadcast
 
+WITH_PT_IMPL = 'USE_PYTORCH_SCATTER' in os.environ
+print(
+    f'Scatter module uses {"PyTorch" if WITH_PT_IMPL else "torch_scatter"} implementation.'
+)
 
-def scatter_sum(src: torch.Tensor, index: torch.Tensor, dim: int = -1,
-                out: Optional[torch.Tensor] = None,
-                dim_size: Optional[int] = None) -> torch.Tensor:
+
+def pt_scatter_reduce(src: torch.Tensor, index: torch.Tensor, dim: int = -1,
+                      out: Optional[torch.Tensor] = None,
+                      dim_size: Optional[int] = None,
+                      reduce: str = 'sum') -> torch.Tensor:
     index = broadcast(index, src, dim)
+    include_self = out is not None
     if out is None:
         size = list(src.size())
         if dim_size is not None:
@@ -18,26 +26,56 @@ def scatter_sum(src: torch.Tensor, index: torch.Tensor, dim: int = -1,
         else:
             size[dim] = int(index.max()) + 1
         out = torch.zeros(size, dtype=src.dtype, device=src.device)
-        return out.scatter_add_(dim, index, src)
+        if reduce == 'sum':
+            return out.scatter_add_(dim, index, src)
+        else:
+            return out.scatter_reduce_(dim, index, src, reduce,
+                                       include_self=include_self)
     else:
-        return out.scatter_add_(dim, index, src)
+        if reduce == 'sum':
+            return out.scatter_add_(dim, index, src)
+        else:
+            return out.scatter_reduce_(dim, index, src, reduce,
+                                       include_self=include_self)
+
+
+def to_pt_reduce(reduce: str):
+    if reduce == 'add':
+        return 'sum'
+    elif reduce == 'mul':
+        return 'prod'
+    elif reduce == 'min':
+        return 'amin'
+    elif reduce == 'max':
+        return 'amax'
+    return reduce
+
+
+def scatter_sum(src: torch.Tensor, index: torch.Tensor, dim: int = -1,
+                out: Optional[torch.Tensor] = None,
+                dim_size: Optional[int] = None) -> torch.Tensor:
+    return pt_scatter_reduce(src, index, dim, out, dim_size, 'sum')
 
 
 def scatter_add(src: torch.Tensor, index: torch.Tensor, dim: int = -1,
                 out: Optional[torch.Tensor] = None,
                 dim_size: Optional[int] = None) -> torch.Tensor:
+    # already uses PyTorch implementation
     return scatter_sum(src, index, dim, out, dim_size)
 
 
 def scatter_mul(src: torch.Tensor, index: torch.Tensor, dim: int = -1,
                 out: Optional[torch.Tensor] = None,
                 dim_size: Optional[int] = None) -> torch.Tensor:
+    # should move to PyTorch implementation
     return torch.ops.torch_scatter.scatter_mul(src, index, dim, out, dim_size)
 
 
 def scatter_mean(src: torch.Tensor, index: torch.Tensor, dim: int = -1,
                  out: Optional[torch.Tensor] = None,
                  dim_size: Optional[int] = None) -> torch.Tensor:
+    # implemented using PyTorch scatter_add_
+    # should replace with scatter_reduce_(..., reduce='mean')
     out = scatter_sum(src, index, dim, out, dim_size)
     dim_size = out.size(dim)
 
@@ -62,6 +100,7 @@ def scatter_min(
         src: torch.Tensor, index: torch.Tensor, dim: int = -1,
         out: Optional[torch.Tensor] = None,
         dim_size: Optional[int] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    # should move to PyTorch implementation
     return torch.ops.torch_scatter.scatter_min(src, index, dim, out, dim_size)
 
 
@@ -69,6 +108,7 @@ def scatter_max(
         src: torch.Tensor, index: torch.Tensor, dim: int = -1,
         out: Optional[torch.Tensor] = None,
         dim_size: Optional[int] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    # should move to PyTorch implementation
     return torch.ops.torch_scatter.scatter_max(src, index, dim, out, dim_size)
 
 
@@ -148,6 +188,9 @@ def scatter(src: torch.Tensor, index: torch.Tensor, dim: int = -1,
 
         torch.Size([10, 3, 64])
     """
+    if WITH_PT_IMPL:
+        return pt_scatter_reduce(src, index, dim, out, dim_size,
+                                 to_pt_reduce(reduce))
     if reduce == 'sum' or reduce == 'add':
         return scatter_sum(src, index, dim, out, dim_size)
     if reduce == 'mul':
